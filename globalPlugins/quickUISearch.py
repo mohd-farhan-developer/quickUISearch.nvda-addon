@@ -1,10 +1,10 @@
 # -*- coding: UTF-8 -*-
 # Quick UI Search Add-on for NVDA
-# TalkBack-style screen search: press NVDA+J, type part of a control's name,
+# TalkBack-style screen search: press NVDA+Alt+Q, type part of a control's name,
 # press Enter and NVDA jumps to that control.
 #
 # Design rules (these are what keep the add-on from disturbing NVDA):
-# - No event handlers. Nothing runs until NVDA+J is pressed.
+# - No event handlers. Nothing runs until NVDA+Alt+Q is pressed.
 # - Every accessibility (COM) call happens on NVDA's main thread. The scan is
 #   split into small time slices so NVDA keeps speaking while it runs.
 # - Nothing is kept after the dialog closes.
@@ -740,7 +740,7 @@ class QuickSearchDialog(wx.Dialog):
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
-    """Has no event handlers: it does nothing until NVDA+J is pressed."""
+    """Has no event handlers: it does nothing until NVDA+Alt+Q is pressed."""
 
     scriptCategory = _("Quick UI Search")
 
@@ -750,7 +750,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
     @scriptHandler.script(
         description=_("Searches the controls on the current screen and moves to the one you choose."),
-        gesture="kb:NVDA+j",
+        gesture="kb:NVDA+alt+q",
     )
     def script_quickUISearch(self, gesture):
         if self._busy:

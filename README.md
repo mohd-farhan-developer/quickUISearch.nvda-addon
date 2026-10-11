@@ -4,7 +4,7 @@ Quick UI Search is an NVDA add-on for Windows that provides **TalkBack-style scr
 
 ## How to use
 
-1. Press **`NVDA+J`** from anywhere.
+1. Press **`NVDA+Alt+Q`** from anywhere (Q for Quick). You can change it in NVDA menu → Preferences → Input gestures → Quick UI Search.
 2. Start typing. The list filters as you type; every word you type must appear in the control.
 3. Press **Enter** (or **Down Arrow** to browse the list first, then Enter) to jump to the control.
 
@@ -36,7 +36,7 @@ Quick UI Search is an NVDA add-on for Windows that provides **TalkBack-style scr
 
 ## Performance
 
-The add-on has no background hooks: it does nothing until you press `NVDA+J`, and keeps nothing after the dialog closes. The screen scan runs in small slices on NVDA's main thread, so NVDA keeps speaking normally while it runs.
+The add-on has no background hooks: it does nothing until you press `NVDA+Alt+Q`, and keeps nothing after the dialog closes. The screen scan runs in small slices on NVDA's main thread, so NVDA keeps speaking normally while it runs.
 
 ## Installation
 

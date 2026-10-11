@@ -3,12 +3,12 @@
 addon_info = {
     "addon_name": "quickUISearch",
     "addon_summary": "Quick UI Search",
-    "addon_description": """Quickly search accessible controls in the currently focused application and jump directly to them using NVDA+J.""",
-    "addon_version": "1.0",
-    "addon_author": "Antigravity Pair Programmer",
-    "addon_url": None,
-    "addon_docFileName": "readme.html",
+    "addon_description": """TalkBack-style screen search: press NVDA+J, type part of a control's name, and jump straight to it. Searches only what is visible in the current window, or only the open dialog or menu.""",
+    "addon_version": "1.1",
+    "addon_author": "Mohd Farhan Hussain",
+    "addon_url": "https://github.com/mohd-farhan-developer/quickUISearch.nvda-addon",
+    "addon_docFileName": None,
     "addon_minimumNVDAVersion": "2023.1",
-    "addon_lastTestedNVDAVersion": "2026.1",
+    "addon_lastTestedNVDAVersion": "2025.3.2",
     "addon_updateChannel": None,
 }

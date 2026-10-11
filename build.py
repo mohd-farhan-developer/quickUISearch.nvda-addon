@@ -5,7 +5,7 @@ addon_name = "quickUISearch"
 output_filename = f"{addon_name}.nvda-addon"
 
 # Files and folders to include
-files_to_include = ["manifest.ini", "buildVars.py", "README.md"]
+files_to_include = ["manifest.ini"]
 folders_to_include = ["globalPlugins"]
 
 def build_addon():

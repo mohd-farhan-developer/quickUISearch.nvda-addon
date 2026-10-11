@@ -1,15 +1,20 @@
 # -*- coding: UTF-8 -*-
 # Quick UI Search Add-on for NVDA
-# TalkBack-style Screen Search:
-# Searches strictly within the active visible interface container (voice channel, chat view, dialog, or tab panel),
-# excluding background views, other Discord servers/channels, and off-screen elements.
+# TalkBack-style screen search: press NVDA+J, type part of a control's name,
+# press Enter and NVDA jumps to that control.
+#
+# Design rules (these are what keep the add-on from disturbing NVDA):
+# - No event handlers. Nothing runs until NVDA+J is pressed.
+# - Every accessibility (COM) call happens on NVDA's main thread. The scan is
+#   split into small time slices so NVDA keeps speaking while it runs.
+# - Nothing is kept after the dialog closes.
 
-import collections
-import threading
+import time
 import wx
 import api
 import ui
 import core
+import speech
 import controlTypes
 import globalPluginHandler
 import scriptHandler
@@ -22,1409 +27,789 @@ try:
 except Exception:
     pass
 
-# Clean up any leftover configuration entries from Search Mode
 try:
-    import config
-    if "quickUISearch" in config.conf:
-        del config.conf["quickUISearch"]
-    if hasattr(config.conf, 'spec') and "quickUISearch" in config.conf.spec:
-        del config.conf.spec["quickUISearch"]
-except Exception:
-    pass
-
-def _(s):
-    # Fallback gettext translator if not already in builtins
-    try:
-        import builtins
-        if hasattr(builtins, '_'):
-            return builtins._(s)
-    except Exception:
-        pass
-    return s
+    _
+except NameError:
+    def _(s):
+        return s
 
 
-# Interactive Control Roles definition
-INTERACTIVE_ROLES = {
-    getattr(controlTypes.Role, 'BUTTON', None),
-    getattr(controlTypes.Role, 'TOGGLE_BUTTON', None),
-    getattr(controlTypes.Role, 'MENUITEM', None),
-    getattr(controlTypes.Role, 'MENUBUTTON', None),
-    getattr(controlTypes.Role, 'POPUPMENU', None),
-    getattr(controlTypes.Role, 'LINK', None),
-    getattr(controlTypes.Role, 'EDITABLETEXT', None),
-    getattr(controlTypes.Role, 'PASSWORDEDIT', None),
-    getattr(controlTypes.Role, 'SPINBUTTON', None),
-    getattr(controlTypes.Role, 'CHECKBOX', None),
-    getattr(controlTypes.Role, 'RADIOBUTTON', None),
-    getattr(controlTypes.Role, 'COMBOBOX', None),
-    getattr(controlTypes.Role, 'TAB', None),
-    getattr(controlTypes.Role, 'TABCONTROL', None),
-    getattr(controlTypes.Role, 'LISTITEM', None),
-    getattr(controlTypes.Role, 'TREEVIEWITEM', None),
-    getattr(controlTypes.Role, 'SLIDER', None),
-}
-INTERACTIVE_ROLES.discard(None)
+Role = controlTypes.Role
+State = controlTypes.State
 
-INTERACTIVE_ROLE_KEYWORDS = (
-    "button", "toggle", "menu", "link", "edit", "box", "radio",
-    "combo", "tab", "list item", "tree item", "slider", "check",
-    "channel", "switch", "picker", "text field", "entry"
+# Time spent scanning per slice before handing control back to NVDA.
+SCAN_SLICE_SECONDS = 0.02
+# Hard limits so a huge tree can never stall NVDA.
+MAX_NODES = 6000
+MAX_DEPTH = 64
+# Delay after the dialog closes before moving focus, so Windows has given the
+# foreground back to the target application.
+JUMP_DELAY_MS = 120
+# How long to wait before checking whether a focus move worked.
+FOCUS_VERIFY_DELAY_MS = 350
+# Containers with more children than this are walked one child at a time.
+LARGE_CONTAINER_CHILDREN = 20
+# When walking such a container, stop after this many scrolled-away items in
+# a row once visible items have been seen.
+SCROLLED_AWAY_LIMIT = 5
+# While scanning, the results list is refreshed at most this often, so NVDA
+# does not keep re-reading the list while you arrow through it.
+LIST_REFRESH_MS = 300
+
+
+def _roles(*names):
+    return frozenset(r for r in (getattr(Role, n, None) for n in names) if r is not None)
+
+
+INTERACTIVE_ROLES = _roles(
+    "BUTTON", "TOGGLE_BUTTON", "MENUITEM", "CHECKMENUITEM", "RADIOMENUITEM",
+    "MENUBUTTON", "DROPDOWNBUTTON", "SPLITBUTTON", "LINK", "EDITABLETEXT",
+    "PASSWORDEDIT", "SPINBUTTON", "CHECKBOX", "RADIOBUTTON", "COMBOBOX", "TAB",
+    "LISTITEM", "TREEVIEWITEM", "SLIDER", "SWITCH", "TABLECELL", "HOTKEYFIELD",
 )
+
+# Containers whose names only repeat what their children already say.
+SKIPPED_ROLES = _roles(
+    "WINDOW", "PANE", "APPLICATION", "FRAME", "SCROLLBAR", "SCROLLPANE",
+    "DOCUMENT", "TITLEBAR", "UNKNOWN", "FILLER", "SEPARATOR", "WHITESPACE",
+)
+
+# Roles that mark a modal or temporary surface; when focus is inside one,
+# the search is limited to it.
+FOCUS_TRAP_ROLES = _roles("DIALOG", "ALERT", "POPUPMENU", "MENU")
 
 
 def getRoleName(obj):
-    """Retrieve clean, human-readable role name across NVDA versions."""
+    """Human-readable role name, e.g. 'button'."""
     try:
-        if hasattr(obj, 'roleText') and obj.roleText:
-            return obj.roleText
-        role = getattr(obj, 'role', None)
-        if role is not None:
-            if hasattr(role, 'displayString') and role.displayString:
-                return role.displayString
-            if hasattr(controlTypes, 'roleLabels') and role in controlTypes.roleLabels:
-                return controlTypes.roleLabels[role]
-            if hasattr(controlTypes, 'role') and hasattr(controlTypes.role, 'Role'):
-                return getattr(role, 'displayString', str(role))
-            return str(role)
+        roleText = obj.roleText
+        if roleText:
+            return roleText
     except Exception:
         pass
-    return _("Control")
-
-
-def checkIsInteractive(obj, roleStr):
-    """Determine if a control is interactive."""
     try:
-        role = getattr(obj, 'role', None)
-        if role in INTERACTIVE_ROLES:
-            return True
+        return obj.role.displayString
     except Exception:
-        pass
-
-    roleLower = (roleStr or "").lower()
-    for kw in INTERACTIVE_ROLE_KEYWORDS:
-        if kw in roleLower:
-            return True
-    return False
+        return _("control")
 
 
-def getCenterCoordinates(obj):
-    """Extract center (X, Y) pixel coordinates from an accessible object."""
+def cleanText(text):
+    """One line of text: line breaks and runs of spaces become single spaces."""
+    return " ".join((text or "").split())
+
+
+def getRect(obj):
+    """Return (left, top, width, height) or None. Reads location once."""
     try:
-        loc = getattr(obj, 'location', None)
-        if loc:
-            if hasattr(loc, 'left') and hasattr(loc, 'top') and hasattr(loc, 'width') and hasattr(loc, 'height'):
-                return (loc.left + loc.width // 2, loc.top + loc.height // 2)
-            elif isinstance(loc, (tuple, list)) and len(loc) >= 4:
-                return (loc[0] + loc[2] // 2, loc[1] + loc[3] // 2)
+        loc = obj.location
     except Exception:
-        pass
-    return None
+        return None
+    if not loc:
+        return None
+    try:
+        return (loc.left, loc.top, loc.width, loc.height)
+    except AttributeError:
+        try:
+            return tuple(loc[:4])
+        except Exception:
+            return None
 
 
-def getWindowBoundingRect(hwnd):
-    """Get the bounding rectangle (left, top, width, height) of a window."""
+def getWindowRect(hwnd):
     if not hwnd:
         return None
     try:
         rect = winUser.getWindowRect(hwnd)
-        if rect:
-            if hasattr(rect, 'left') and hasattr(rect, 'top') and hasattr(rect, 'right') and hasattr(rect, 'bottom'):
-                return (rect.left, rect.top, max(0, rect.right - rect.left), max(0, rect.bottom - rect.top))
-            elif isinstance(rect, (tuple, list)) and len(rect) >= 4:
-                return (rect[0], rect[1], max(0, rect[2] - rect[0]), max(0, rect[3] - rect[1]))
+        return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
     except Exception:
-        pass
-    return None
+        return None
 
 
-def isControlVisibleOnScreen(obj, windowRect=None):
-    """
-    Strict Screen-Search Visibility Check.
-    Ensures the control is physically visible on the active screen and not hidden,
-    collapsed, offscreen, zero-size, or clipped outside the window viewport.
-    """
-    if obj is None:
-        return False
-
+def getRootWindow(hwnd):
+    if not hwnd:
+        return None
     try:
-        states = getattr(obj, 'states', set())
+        return winUser.getAncestor(hwnd, winUser.GA_ROOT) or hwnd
+    except Exception:
+        return hwnd
 
-        # 1. State filtering: Must not be invisible, unavailable, or offscreen
-        if (
-            controlTypes.State.INVISIBLE in states or
-            controlTypes.State.UNAVAILABLE in states or
-            controlTypes.State.OFFSCREEN in states
-        ):
+
+def rectsIntersect(a, b):
+    return not (
+        a[0] + a[2] <= b[0] or b[0] + b[2] <= a[0]
+        or a[1] + a[3] <= b[1] or b[1] + b[3] <= a[1]
+    )
+
+
+def getVisibleArea(searchRoot, fallbackHwnd):
+    """
+    The area a control must touch to count as visible: the search root's own
+    top-level window (so a popup menu is not clipped to the app window),
+    limited to the screen(s).
+    """
+    hwnd = getattr(searchRoot, "windowHandle", None) or fallbackHwnd
+    rect = getWindowRect(getRootWindow(hwnd))
+    try:
+        import ctypes
+        metrics = ctypes.windll.user32.GetSystemMetrics
+        # SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN
+        screen = (metrics(76), metrics(77), metrics(78), metrics(79))
+    except Exception:
+        return rect
+    if not rect:
+        return screen
+    left = max(rect[0], screen[0])
+    top = max(rect[1], screen[1])
+    right = min(rect[0] + rect[2], screen[0] + screen[2])
+    bottom = min(rect[1] + rect[3], screen[1] + screen[3])
+    if right <= left or bottom <= top:
+        return screen
+    return (left, top, right - left, bottom - top)
+
+
+def resolveSearchRoot(focus, foreground):
+    """
+    Search the whole foreground window, unless focus is inside a dialog,
+    alert or open menu: then search only that, like TalkBack does.
+    """
+    obj = focus
+    depth = 0
+    while obj and depth < MAX_DEPTH:
+        try:
+            if obj == foreground:
+                break
+            if obj.role in FOCUS_TRAP_ROLES:
+                return obj
+            obj = obj.parent
+        except Exception:
+            break
+        depth += 1
+    return foreground
+
+
+class ScreenScanner:
+    """
+    Walks the accessibility tree of the search root in document order, on the
+    main thread, a few milliseconds at a time.
+    """
+
+    def __init__(self, root, windowRect, onBatch, onDone):
+        self._windowRect = windowRect
+        self._onBatch = onBatch
+        self._onDone = onDone
+        # Stack items: (object, depth, name of the nearest interactive
+        # ancestor lowercased, sibling chain)
+        # The sibling chain is a dict for children of large containers that are
+        # walked one sibling at a time instead of fetched all at once.
+        self._stack = [(root, 0, "", None)]
+        self._seen = set()
+        self._visited = 0
+        self._order = 0
+        # Name of the last listed interactive control, lowercased.
+        self._lastInteractiveName = ""
+        self._cancelled = False
+        self.finished = False
+
+    def start(self):
+        self._schedule()
+
+    def _schedule(self):
+        # CallAfter runs as soon as NVDA has handled pending input and events;
+        # a CallLater timer would add roughly 100 ms between slices.
+        wx.CallAfter(self._step)
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _step(self):
+        if self._cancelled:
+            return
+        deadline = time.perf_counter() + SCAN_SLICE_SECONDS
+        batch = []
+        while self._stack and self._visited < MAX_NODES:
+            obj, depth, parentName, chain = self._stack.pop()
+            self._visited += 1
+            try:
+                self._visit(obj, depth, parentName, chain, batch)
+            except Exception:
+                log.debugWarning("QuickUISearch: error reading object", exc_info=True)
+            if time.perf_counter() >= deadline:
+                break
+        if self._cancelled:
+            return
+        if batch:
+            self._onBatch(batch)
+        if self._stack and self._visited < MAX_NODES:
+            self._schedule()
+        else:
+            if self._visited >= MAX_NODES:
+                log.info(f"QuickUISearch: scan stopped at the {MAX_NODES} object limit")
+            self.finished = True
+            self._onDone()
+
+    def _isVisible(self, states, rect):
+        if State.INVISIBLE in states or State.OFFSCREEN in states:
             return False
-
-        # If collapsed container with no direct interactivity, skip child branch
-        if controlTypes.State.COLLAPSED in states:
-            role = getattr(obj, 'role', None)
-            if role not in INTERACTIVE_ROLES:
+        if rect is not None:
+            if rect[2] <= 0 or rect[3] <= 0:
                 return False
-
-    except Exception:
-        return False
-
-    try:
-        # 2. Location & Dimensions Check
-        loc = getattr(obj, 'location', None)
-        if not loc:
-            if hasattr(obj, 'isLocationOnScreen') and not obj.isLocationOnScreen:
+            if self._windowRect and not rectsIntersect(rect, self._windowRect):
                 return False
+        return True
+
+    def _isScrolledAway(self, states, rect):
+        if State.OFFSCREEN in states:
             return True
+        return bool(rect and self._windowRect and rect[2] > 0 and rect[3] > 0
+            and not rectsIntersect(rect, self._windowRect))
 
-        left = getattr(loc, 'left', None)
-        top = getattr(loc, 'top', None)
-        width = getattr(loc, 'width', None)
-        height = getattr(loc, 'height', None)
+    def _visit(self, obj, depth, parentName, chain, batch):
+        states = obj.states
+        rect = getRect(obj)
+        visible = self._isVisible(states, rect)
 
-        if left is None and isinstance(loc, (tuple, list)) and len(loc) >= 4:
-            left, top, width, height = loc[0], loc[1], loc[2], loc[3]
+        if chain is not None:
+            # The visible items of a long list form one block; once several
+            # items in a row after it are scrolled away, the rest are too.
+            # Hidden items (tooltips, collapsed parts) can sit inside the
+            # block, so they do not end it.
+            if visible:
+                chain["seenVisible"] = True
+                chain["scrolledAway"] = 0
+            elif chain["seenVisible"] and self._isScrolledAway(states, rect):
+                chain["scrolledAway"] += 1
+            if chain["scrolledAway"] < SCROLLED_AWAY_LIMIT:
+                nextObj = obj.next
+                if nextObj:
+                    # Pushed before the children so they are visited first.
+                    self._stack.append((nextObj, depth, parentName, chain))
+        if not visible:
+            return
 
-        if width is not None and height is not None:
-            # Must have positive dimensions on screen
-            if width <= 0 or height <= 0:
-                return False
+        role = obj.role
+        name = cleanText(obj.name)
+        nameLower = name.lower()
+        interactive = role in INTERACTIVE_ROLES or State.FOCUSABLE in states
 
-        # 3. Window Viewport Boundary Check
-        if windowRect and left is not None and top is not None and width is not None and height is not None:
-            wLeft, wTop, wWidth, wHeight = windowRect
-            wRight = wLeft + wWidth
-            wBottom = wTop + wHeight
+        if role not in SKIPPED_ROLES:
+            item = self._makeItem(obj, role, states, interactive, name, nameLower, parentName, rect)
+            if item:
+                batch.append(item)
 
-            objRight = left + width
-            objBottom = top + height
+        if depth >= MAX_DEPTH:
+            return
+        # A collapsed control's children are not on screen.
+        if State.COLLAPSED in states:
+            return
+        childParentName = nameLower if interactive and nameLower else parentName
+        if hasattr(obj, "IAccessibleObject") and obj.childCount > LARGE_CONTAINER_CHILDREN:
+            # Fetching thousands of children at once (e.g. a big file list)
+            # would block NVDA; walk them one by one instead.
+            firstChild = obj.firstChild
+            if firstChild:
+                self._stack.append((firstChild, depth + 1, childParentName, {"seenVisible": False, "scrolledAway": 0}))
+            return
+        children = obj.children
+        if not children:
+            return
+        # Reversed so the first child is popped first (document order).
+        for child in reversed(children):
+            if child:
+                self._stack.append((child, depth + 1, childParentName, None))
 
-            # Must intersect with the active window viewport
-            if objRight <= wLeft or left >= wRight or objBottom <= wTop or top >= wBottom:
-                return False
-
-    except Exception as e:
-        log.debug(f"QuickUISearch: visibility check error: {e}")
-
-    return True
-
-
-def getObjectId(obj):
-    """Generate a stable, unique identifier for an accessible object."""
-    if obj is None:
-        return None
-    try:
-        uiaElem = getattr(obj, 'UIAutomationElement', None) or getattr(obj, 'UIAElement', None)
-        if uiaElem:
+    def _makeItem(self, obj, role, states, interactive, name, nameLower, parentName, rect):
+        value = ""
+        # A link's value is its address, which is only noise here.
+        if interactive and role != Role.LINK:
             try:
-                rtId = uiaElem.GetRuntimeId()
-                if rtId:
-                    return ("UIA_RT", tuple(rtId))
+                value = cleanText(obj.value)
             except Exception:
-                pass
+                value = ""
+        if not name and not value:
+            return None
+        # Text inside or right after a control usually repeats part of the
+        # control's own name (Discord: "Sound Arena" after the server item, or
+        # the "2" of "2 mentions").
+        if not interactive and nameLower and (
+            nameLower in parentName or nameLower in self._lastInteractiveName
+        ):
+            return None
 
-        hwnd = getattr(obj, 'windowHandle', None)
-        childId = getattr(obj, 'IAccessibleChildID', None)
-        role = getattr(obj, 'role', None)
+        key = (role, nameLower, value, rect)
+        if key in self._seen:
+            return None
+        self._seen.add(key)
 
-        iacc = getattr(obj, 'IAccessibleObject', None)
-        if iacc and hwnd is not None:
-            try:
-                iaccPtr = iacc._com_pointers.get(iacc._iid, None) if hasattr(iacc, '_com_pointers') else None
-                if iaccPtr:
-                    return ("IACC_PTR", hwnd, childId, iaccPtr)
-            except Exception:
-                pass
+        roleName = getRoleName(obj)
+        description = ""
+        try:
+            description = cleanText(obj.description)
+        except Exception:
+            pass
+        self._order += 1
+        self._lastInteractiveName = nameLower if interactive else ""
+        return {
+            "object": obj,
+            "name": name,
+            "value": value,
+            "description": description,
+            "role": roleName,
+            "unavailable": State.UNAVAILABLE in states,
+            "isInteractive": interactive,
+            "order": self._order,
+            "searchText": f"{name} {value} {description} {roleName}".lower(),
+        }
 
-        loc = getattr(obj, 'location', None)
-        locTuple = (loc.left, loc.top, loc.width, loc.height) if loc else None
-        name = getattr(obj, 'name', '') or ''
-        autoId = getattr(obj, 'UIAAutomationId', None)
 
-        if autoId:
-            return ("UIA_AUTOID", hwnd, autoId, role)
-
-        return ("ACC_COMPOSITE", hwnd, childId, role, name, locTuple)
-    except Exception:
-        return ("OBJ_FALLBACK", getattr(obj, 'windowHandle', None), id(obj))
-
-
-def extractControlInfo(obj, windowRect=None):
+def rankAndFilterControls(controls, query):
     """
-    Inspect and extract searchable metadata for an accessible object.
-    Only returns metadata if the control is confirmed visible on screen.
+    Every word of the query must appear somewhere in the control's text.
+    Ranking: exact name > name starts with query > a word in the name starts
+    with query > name contains query > other text matches; interactive controls
+    before plain text; then screen (document) order.
     """
-    if not isControlVisibleOnScreen(obj, windowRect):
-        return None
+    query = (query or "").strip().lower()
+    if not query:
+        return list(controls)
+    words = query.split()
+    matches = [c for c in controls if all(w in c["searchText"] for w in words)]
 
-    try:
-        name = getattr(obj, 'name', '') or ''
-        desc = getattr(obj, 'description', '') or ''
-        val = getattr(obj, 'value', '')
-        valStr = str(val) if val is not None else ''
-        roleStr = getRoleName(obj)
+    def sortKey(c):
+        name = c["name"].lower()
+        if name == query:
+            tier = 0
+        elif name.startswith(query):
+            tier = 1
+        elif any(w.startswith(query) for w in name.split()):
+            tier = 2
+        elif query in name:
+            tier = 3
+        elif all(w in name for w in words):
+            tier = 4
+        else:
+            tier = 5
+        return (tier, 0 if c["isInteractive"] else 1, c["order"])
 
-        name = name.strip()
-        desc = desc.strip()
-        valStr = valStr.strip()
-
-        if name or desc or valStr:
-            stableId = getObjectId(obj)
-            isInteractive = checkIsInteractive(obj, roleStr)
-            center = getCenterCoordinates(obj)
-            hwnd = getattr(obj, 'windowHandle', None)
-
-            return {
-                "id": stableId,
-                "object": obj,
-                "name": name,
-                "description": desc,
-                "valStr": valStr,
-                "role": roleStr,
-                "isInteractive": isInteractive,
-                "center": center,
-                "hwnd": hwnd,
-                "searchIndex": f"{name} {desc} {valStr} {roleStr}".lower(),
-            }
-    except Exception as e:
-        log.debug(f"QuickUISearch: error extracting control info: {e}")
-    return None
+    matches.sort(key=sortKey)
+    return matches
 
 
 def formatDisplayStrings(controls):
-    """
-    Format display strings for a list of controls.
-    Displays 'Name — Role'.
-    Includes description only when needed to distinguish identical names.
-    """
-    counts = collections.Counter((c["name"].lower(), c["role"].lower()) for c in controls if c.get("name"))
-    formatted = []
+    """'Name, role'. Value/description are added only when they help.
+    A comma, not a dash, so NVDA reads it as a natural pause."""
+    result = []
     for c in controls:
-        name = c.get("name", "").strip()
-        roleStr = c.get("role", "").strip() or _("Control")
-        desc = c.get("description", "").strip()
-
-        isDuplicateName = counts[(name.lower(), roleStr.lower())] > 1
-
-        if not name:
-            if desc:
-                display = f"{desc} — {roleStr}"
-            else:
-                display = roleStr
-        elif isDuplicateName and desc and desc.lower() != name.lower():
-            display = f"{name} ({desc}) — {roleStr}"
-        else:
-            display = f"{name} — {roleStr}"
-
-        formatted.append(display)
-    return formatted
+        label = c["name"] or c["value"]
+        if c["name"] and c["value"] and c["value"].lower() != c["name"].lower():
+            label = f"{c['name']}: {c['value']}"
+        text = f"{label}, {c['role']}"
+        if c["unavailable"]:
+            text += " " + _("(unavailable)")
+        result.append(text)
+    # Add the description to entries that would otherwise read the same.
+    counts = {}
+    for t in result:
+        counts[t] = counts.get(t, 0) + 1
+    for i, c in enumerate(controls):
+        desc = c["description"]
+        if counts[result[i]] > 1 and desc and desc.lower() != c["name"].lower():
+            result[i] = f"{result[i]} ({desc})"
+    return result
 
 
-def rankAndFilterControls(allControls, query, focusInfo):
-    """
-    Rank visible screen controls by:
-    1. Query matching tiers (exact name > starts with name > contains name > desc/value > role)
-    2. Interactive controls first
-    3. Proximity to current keyboard focus
-    4. Shorter / cleaner names
-    """
-    queryLower = (query or "").strip().lower()
-
-    if queryLower:
-        candidates = [c for c in allControls if queryLower in c["searchIndex"]]
-    else:
-        candidates = list(allControls)
-
-    focusHwnd, focusCenter = focusInfo
-
-    def sortKey(c):
-        nameLower = c["name"].lower()
-        descLower = c["description"].lower()
-        valLower = c.get("valStr", "").lower()
-        roleLower = c["role"].lower()
-
-        # 1. Match Tier
-        if not queryLower:
-            matchTier = 0
-        elif nameLower == queryLower:
-            matchTier = 0  # Exact name match
-        elif nameLower.startswith(queryLower):
-            matchTier = 1  # Name starts with search text
-        elif queryLower in nameLower:
-            matchTier = 2  # Name contains search text
-        elif queryLower in descLower or queryLower in valLower:
-            matchTier = 3  # Description/value contains search text
-        elif queryLower in roleLower:
-            matchTier = 4  # Role contains search text
-        else:
-            matchTier = 5
-
-        # 2. Interactive controls first
-        interactiveTier = 0 if c.get("isInteractive", False) else 1
-
-        # 3. Focus proximity distance
-        locCenter = c.get("center")
-        if focusCenter and locCenter:
-            dist = int(((focusCenter[0] - locCenter[0]) ** 2 + (focusCenter[1] - locCenter[1]) ** 2) ** 0.5)
-        else:
-            dist = 999999
-
-        if focusHwnd and c.get("hwnd") != focusHwnd:
-            dist += 10000
-
-        return (matchTier, interactiveTier, dist, len(c["name"]), nameLower)
-
-    candidates.sort(key=sortKey)
-    return candidates
-
-
-def countInteractiveDescendants(candidateContainer, windowRect, maxLimit=30):
-    """
-    Fast validation helper: counts visible interactive descendants within candidateContainer.
-    Returns the count (capped at maxLimit for speed).
-    """
-    if not candidateContainer:
-        return 0
-
-    count = 0
-    visited = set()
-    queue = collections.deque([candidateContainer])
-
-    while queue and count < maxLimit:
-        node = queue.popleft()
-        if not node:
-            continue
-
-        nodeId = getObjectId(node)
-        if nodeId in visited:
-            continue
-        visited.add(nodeId)
-
-        if not isControlVisibleOnScreen(node, windowRect):
-            continue
-
-        roleStr = getRoleName(node)
-        if checkIsInteractive(node, roleStr):
-            name = (getattr(node, 'name', '') or '').strip()
-            desc = (getattr(node, 'description', '') or '').strip()
-            val = str(getattr(node, 'value', '') or '').strip()
-            if name or desc or val:
-                count += 1
-
+def _bringToForeground(obj):
+    root = getRootWindow(getattr(obj, "windowHandle", None))
+    if root and root != winUser.getForegroundWindow():
         try:
-            children = node.children
-            if children:
-                for ch in children:
-                    if ch:
-                        queue.append(ch)
+            winUser.setForegroundWindow(root)
         except Exception:
-            pass
-
-    return count
+            log.debugWarning("QuickUISearch: setForegroundWindow failed", exc_info=True)
 
 
-def resolveActiveInteractiveScope(originalFocus, topRoot, windowRect):
+def _moveBrowseModeCaret(obj):
     """
-    Reliable Active Container Detection Algorithm:
-    1. Start from the focused control.
-    2. Ascend the parent hierarchy, evaluating each ancestor candidate.
-    3. Count visible interactive descendants.
-    4. If count = 0, automatically fall back to the next parent.
-    5. Stop at the first ancestor with verified interactive controls.
-    6. Falls back safely to topRoot so search never returns 0 results when controls are present.
+    If the control is inside a document in browse mode, move the browse mode
+    caret to it, like NVDA's Elements List does. Returns True on success.
     """
-    log.info("QuickUISearch: Starting resolveActiveInteractiveScope")
-
-    if not originalFocus:
-        log.info(f"QuickUISearch: No originalFocus, using topRoot: {getRoleName(topRoot)}")
-        return topRoot
-
-    # Build chain of ancestors up to topRoot
-    ancestors = []
-    curr = originalFocus
-    while curr and curr != topRoot:
-        ancestors.append(curr)
-        try:
-            curr = getattr(curr, 'parent', None)
-        except Exception:
-            break
-    ancestors.append(topRoot)
-
-    log.info(f"QuickUISearch: Ancestor chain length: {len(ancestors)}")
-
-    selectedScope = None
-    selectedCount = 0
-
-    for idx, candidate in enumerate(ancestors):
-        roleName = getRoleName(candidate)
-        candName = getattr(candidate, 'name', '') or ''
-
-        log.info(f"QuickUISearch: [Attempt #{idx+1}] Evaluating candidate container: {roleName} ('{candName}')")
-
-        count = countInteractiveDescendants(candidate, windowRect, maxLimit=30)
-        log.info(f"QuickUISearch: Candidate {roleName} ('{candName}') interactive descendant count: {count}")
-
-        if count > 0:
-            if candidate == originalFocus and count <= 1 and len(ancestors) > idx + 1:
-                parentCand = ancestors[idx + 1]
-                parentCount = countInteractiveDescendants(parentCand, windowRect, maxLimit=30)
-                if parentCount > 1:
-                    log.info(f"QuickUISearch: Focused element expanded to parent {getRoleName(parentCand)} with {parentCount} controls")
-                    selectedScope = parentCand
-                    selectedCount = parentCount
-                    break
-
-            selectedScope = candidate
-            selectedCount = count
-            break
-        else:
-            log.info(f"QuickUISearch: Candidate {roleName} has 0 interactive controls; attempting fallback to next parent")
-
-    if not selectedScope:
-        selectedScope = topRoot
-        selectedCount = countInteractiveDescendants(topRoot, windowRect, maxLimit=30)
-        log.info(f"QuickUISearch: All intermediate ancestors empty, fell back to topRoot: {getRoleName(topRoot)} with {selectedCount} controls")
-
-    finalRole = getRoleName(selectedScope)
-    finalName = getattr(selectedScope, 'name', '') or ''
-    log.info(f"QuickUISearch: Final selected scope: {finalRole} ('{finalName}') with {selectedCount} verified interactive controls")
-
-    return selectedScope
-
-
-class TreeCacheManager:
-    """
-    Manages active visible screen scoping and real-time synchronization.
-    Builds a fresh visible scope on screen changes and purges background/stale controls.
-    """
-
-    def __init__(self):
-        # scopeKey -> OrderedDict of { stableId: controlDict }
-        self._scopeCache = {}
-        self._currentScopeKey = None
-        self._lock = threading.RLock()
-        self._indexingThread = None
-        self._liveScanThread = None
-        self._cancelIndexingEvent = threading.Event()
-        self._cancelLiveScanEvent = threading.Event()
-        self.isIndexing = False
-
-    def getVisibleControls(self, scopeKey):
-        with self._lock:
-            if scopeKey in self._scopeCache:
-                return list(self._scopeCache[scopeKey].values())
-            return []
-
-    def setVisibleScope(self, scopeKey, controlsList):
-        with self._lock:
-            self._currentScopeKey = scopeKey
-            self._scopeCache[scopeKey] = collections.OrderedDict((c["id"], c) for c in controlsList)
-
-    def upsertVisibleControl(self, scopeKey, controlDict):
-        if not controlDict:
-            return False
-        with self._lock:
-            if scopeKey not in self._scopeCache:
-                self._scopeCache[scopeKey] = collections.OrderedDict()
-            isNew = controlDict["id"] not in self._scopeCache[scopeKey]
-            self._scopeCache[scopeKey][controlDict["id"]] = controlDict
-            return isNew
-
-    def removeVisibleControl(self, scopeKey, objId):
-        with self._lock:
-            if scopeKey in self._scopeCache and objId in self._scopeCache[scopeKey]:
-                del self._scopeCache[scopeKey][objId]
-                return True
-            return False
-
-    def clearScope(self, scopeKey):
-        with self._lock:
-            if scopeKey in self._scopeCache:
-                del self._scopeCache[scopeKey]
-
-    def clearAll(self):
-        with self._lock:
-            self._scopeCache.clear()
-            self._currentScopeKey = None
-
-    def stopAllWorkers(self):
-        """Immediately signals all background threads to stop."""
-        log.info("QuickUISearch: stopAllWorkers requested")
-        self._cancelIndexingEvent.set()
-        self._cancelLiveScanEvent.set()
-        self.isIndexing = False
-
-    def startVisibleScopeIndexing(self, scopeRoot, scopeKey, windowRect, onBatch=None, onProgress=None, onFinished=None):
-        """Start asynchronous BFS indexing strictly restricted to the visible screen scope."""
-        self.stopAllWorkers()
-        self._cancelIndexingEvent = threading.Event()
-        cancelEvent = self._cancelIndexingEvent
-        self.isIndexing = True
-
-        thread = threading.Thread(
-            target=self._visibleIndexingWorker,
-            args=(scopeRoot, scopeKey, windowRect, cancelEvent, onBatch, onProgress, onFinished),
-            name="QuickUISearchVisibleIndexingThread",
-            daemon=True
-        )
-        self._indexingThread = thread
-        log.info("QuickUISearch: Starting visible screen scope indexing worker")
-        thread.start()
-
-    def _visibleIndexingWorker(self, scopeRoot, scopeKey, windowRect, cancelEvent, onBatch, onProgress, onFinished):
-        log.info(f"QuickUISearch: Visible indexing worker started for scope {scopeKey}")
-        comInitialized = False
-        try:
-            import comtypes
-            comtypes.CoInitialize()
-            comInitialized = True
-        except Exception as e:
-            log.debug(f"QuickUISearch: CoInitialize exception: {e}")
-
-        visited = set()
-        queue = collections.deque([scopeRoot])
-        processedCount = 0
-        batch = []
-        visibleDict = collections.OrderedDict()
-
-        try:
-            while queue and not cancelEvent.is_set():
-                currentObj = queue.popleft()
-                if not currentObj or cancelEvent.is_set():
-                    break
-
-                processedCount += 1
-                if processedCount % 500 == 0:
-                    log.debug(f"QuickUISearch: Visible indexing progress {processedCount} controls")
-                    if onProgress and not cancelEvent.is_set():
-                        wx.CallAfter(onProgress, processedCount)
-
-                objId = getObjectId(currentObj)
-                if objId in visited:
-                    continue
-                visited.add(objId)
-
-                # Skip completely non-visible or off-screen branches
-                if not isControlVisibleOnScreen(currentObj, windowRect):
-                    continue
-
-                info = extractControlInfo(currentObj, windowRect)
-                if info:
-                    visibleDict[info["id"]] = info
-                    batch.append(info)
-
-                if len(batch) >= 20:
-                    if onBatch and not cancelEvent.is_set():
-                        batchCopy = list(batch)
-                        wx.CallAfter(onBatch, batchCopy)
-                    batch.clear()
-
-                if cancelEvent.is_set():
-                    break
-
-                # Enqueue visible children
-                try:
-                    children = currentObj.children
-                    if children:
-                        for child in children:
-                            if child and not cancelEvent.is_set():
-                                queue.append(child)
-                except Exception as e:
-                    log.debug(f"QuickUISearch: error getting children: {e}")
-
-            if batch and onBatch and not cancelEvent.is_set():
-                batchCopy = list(batch)
-                wx.CallAfter(onBatch, batchCopy)
-
-        except Exception as e:
-            log.error(f"QuickUISearch: visible indexing error: {e}", exc_info=True)
-        finally:
-            if comInitialized:
-                try:
-                    import comtypes
-                    comtypes.CoUninitialize()
-                except Exception:
-                    pass
-
-        log.info(f"QuickUISearch: Visible indexing completed. Found {len(visibleDict)} visible controls")
-
-        if not cancelEvent.is_set():
-            self.setVisibleScope(scopeKey, list(visibleDict.values()))
-            self.isIndexing = False
-            if onFinished and not cancelEvent.is_set():
-                wx.CallAfter(onFinished, list(visibleDict.values()))
-
-    def startVisibleLiveScan(self, scopeRoot, focusedObj, scopeKey, windowRect, onNewMatches=None, onFinished=None):
-        """Live scan strictly restricted to visible screen elements in the active container."""
-        self._cancelLiveScanEvent.set()
-        self._cancelLiveScanEvent = threading.Event()
-        cancelEvent = self._cancelLiveScanEvent
-
-        thread = threading.Thread(
-            target=self._visibleLiveScanWorker,
-            args=(scopeRoot, focusedObj, scopeKey, windowRect, cancelEvent, onNewMatches, onFinished),
-            name="QuickUISearchVisibleLiveScanThread",
-            daemon=True
-        )
-        self._liveScanThread = thread
-        log.info("QuickUISearch: Starting visible live scan worker")
-        thread.start()
-
-    def _visibleLiveScanWorker(self, scopeRoot, focusedObj, scopeKey, windowRect, cancelEvent, onNewMatches, onFinished):
-        comInitialized = False
-        try:
-            import comtypes
-            comtypes.CoInitialize()
-            comInitialized = True
-        except Exception as e:
-            log.debug(f"QuickUISearch: CoInitialize exception: {e}")
-
-        newDiscovered = []
-        visited = set()
-        queue = collections.deque()
-
-        if focusedObj:
-            queue.append(focusedObj)
-        if scopeRoot and scopeRoot != focusedObj:
-            queue.append(scopeRoot)
-
-        try:
-            while queue and not cancelEvent.is_set():
-                currentObj = queue.popleft()
-                if not currentObj or cancelEvent.is_set():
-                    break
-
-                objId = getObjectId(currentObj)
-                if objId in visited:
-                    continue
-                visited.add(objId)
-
-                if not isControlVisibleOnScreen(currentObj, windowRect):
-                    continue
-
-                info = extractControlInfo(currentObj, windowRect)
-                if info:
-                    isNew = self.upsertVisibleControl(scopeKey, info)
-                    if isNew:
-                        newDiscovered.append(info)
-
-                if cancelEvent.is_set():
-                    break
-
-                try:
-                    children = currentObj.children
-                    if children:
-                        for child in children:
-                            if child and not cancelEvent.is_set():
-                                queue.append(child)
-                except Exception as e:
-                    log.debug(f"QuickUISearch: live scan children error: {e}")
-
-        except Exception as e:
-            log.debug(f"QuickUISearch: live scan error: {e}")
-        finally:
-            if comInitialized:
-                try:
-                    import comtypes
-                    comtypes.CoUninitialize()
-                except Exception:
-                    pass
-
-        log.info(f"QuickUISearch: Live scan worker exiting. Cancelled={cancelEvent.is_set()}, NewDiscovered={len(newDiscovered)}")
-
-        if not cancelEvent.is_set():
-            if newDiscovered and onNewMatches and not cancelEvent.is_set():
-                wx.CallAfter(onNewMatches, list(newDiscovered))
-            if onFinished and not cancelEvent.is_set():
-                wx.CallAfter(onFinished)
-
-    def scanVisibleBranch(self, branchRoot, scopeKey, windowRect):
-        """Synchronously scan a small branch of visible controls on the main thread."""
-        if not branchRoot or not isControlVisibleOnScreen(branchRoot, windowRect):
-            return []
-
-        results = []
-        visited = set()
-        queue = collections.deque([branchRoot])
-
-        while queue:
-            currentObj = queue.popleft()
-            if not currentObj:
-                continue
-
-            objId = getObjectId(currentObj)
-            if objId in visited:
-                continue
-            visited.add(objId)
-
-            if not isControlVisibleOnScreen(currentObj, windowRect):
-                continue
-
-            info = extractControlInfo(currentObj, windowRect)
-            if info:
-                self.upsertVisibleControl(scopeKey, info)
-                results.append(info)
-
-            try:
-                children = currentObj.children
-                if children:
-                    for child in children:
-                        if child:
-                            queue.append(child)
-            except Exception:
-                pass
-
-        return results
-
-
-# Global singleton cache manager
-cacheManager = TreeCacheManager()
-
-
-def jumpToControl(targetObj, originalFocus):
-    """Move OS and NVDA focus directly to target control on the main thread, or announce if unavailable."""
-    log.info("QuickUISearch: jumpToControl executing on main thread")
-    if not targetObj:
-        log.warning("QuickUISearch: targetObj is None")
-        try:
-            ui.message(_("Control no longer available."))
-        except Exception:
-            pass
-        restoreFocus(originalFocus)
-        return
-
     try:
-        states = getattr(targetObj, 'states', None)
-        if states is None or controlTypes.State.UNAVAILABLE in states:
-            log.warning("QuickUISearch: targetObj is unavailable")
-            try:
-                ui.message(_("Control no longer available."))
-            except Exception:
-                pass
-            restoreFocus(originalFocus)
+        import browseMode
+        ti = obj.treeInterceptor
+        if (
+            not isinstance(ti, browseMode.BrowseModeDocumentTreeInterceptor)
+            or ti.passThrough
+            or not getattr(ti, "isReady", True)
+        ):
+            return False
+        info = ti.makeTextInfo(obj)
+        item = browseMode.TextInfoQuickNavItem("quickUISearch", ti, info)
+        item.moveTo()
+        # Drop NVDA's announcement of the window regaining focus, so the
+        # control we moved to is what gets read.
+        speech.cancelSpeech()
+        item.report()
+        return True
+    except Exception:
+        log.debugWarning("QuickUISearch: browse mode move failed", exc_info=True)
+        return False
+
+
+def _moveNavigator(obj):
+    """Last resort for controls that cannot take focus: move NVDA's navigator
+    object (review position) there and read it."""
+    try:
+        api.setNavigatorObject(obj)
+        speech.cancelSpeech()
+        speech.speakObject(obj, reason=controlTypes.OutputReason.QUERY)
+        return True
+    except Exception:
+        log.debugWarning("QuickUISearch: navigator move failed", exc_info=True)
+        return False
+
+
+def jumpToControl(obj, originalFocus, onDone):
+    """Move to the chosen control. Never pulls focus back afterwards."""
+    try:
+        _bringToForeground(obj)
+        if _moveBrowseModeCaret(obj):
+            onDone()
             return
-
-        hwnd = getattr(targetObj, 'windowHandle', None)
-        if hwnd:
-            try:
-                winUser.setForegroundWindow(hwnd)
-            except Exception as e:
-                log.debug(f"QuickUISearch: setForegroundWindow error: {e}")
-
-        try:
-            targetObj.setFocus()
-        except Exception as e:
-            log.debug(f"QuickUISearch: targetObj.setFocus error: {e}")
-
-        try:
-            api.setFocusObject(targetObj)
-        except Exception as e:
-            log.debug(f"QuickUISearch: api.setFocusObject error: {e}")
-
-        try:
-            targetObj.reportFocus()
-        except Exception as e:
-            log.debug(f"QuickUISearch: reportFocus error: {e}")
-
-        log.info("QuickUISearch: jumpToControl successfully completed")
-    except Exception as e:
-        log.error(f"QuickUISearch: exception in jumpToControl: {e}", exc_info=True)
-        try:
-            ui.message(_("Control no longer available."))
-        except Exception:
-            pass
-        restoreFocus(originalFocus)
+        states = obj.states
+        canFocus = State.FOCUSABLE in states and State.UNAVAILABLE not in states
+        if canFocus:
+            obj.setFocus()
+            core.callLater(FOCUS_VERIFY_DELAY_MS, _verifyFocus, obj, originalFocus, onDone)
+            return
+        if not _moveNavigator(obj):
+            ui.message(_("Unable to move to that control."))
+    except Exception:
+        log.debugWarning("QuickUISearch: jump failed", exc_info=True)
+        if not _moveNavigator(obj):
+            ui.message(_("Unable to move to that control."))
+    onDone()
 
 
-def restoreFocus(origObj):
-    """Restore keyboard focus to original focus object on the main thread upon dialog cancellation."""
-    log.info("QuickUISearch: restoreFocus executing on main thread")
-    if not origObj:
-        log.warning("QuickUISearch: origObj is None")
-        return
-
+def _verifyFocus(obj, originalFocus, onDone):
     try:
-        hwnd = getattr(origObj, 'windowHandle', None)
-        if hwnd:
-            try:
-                winUser.setForegroundWindow(hwnd)
-            except Exception as e:
-                log.debug(f"QuickUISearch: restore setForegroundWindow error: {e}")
+        focus = api.getFocusObject()
+        # If focus did not leave where it was, fall back to the review cursor.
+        if focus != obj and (originalFocus is None or focus == originalFocus):
+            log.debug("QuickUISearch: focus did not move, using navigator object")
+            if not _moveNavigator(obj):
+                ui.message(_("Unable to move to that control."))
+    except Exception:
+        log.debugWarning("QuickUISearch: focus verification failed", exc_info=True)
+    finally:
+        onDone()
 
-        try:
-            origObj.setFocus()
-        except Exception as e:
-            log.debug(f"QuickUISearch: restore origObj.setFocus error: {e}")
 
-        try:
-            api.setFocusObject(origObj)
-        except Exception as e:
-            log.debug(f"QuickUISearch: restore api.setFocusObject error: {e}")
-
-        log.info("QuickUISearch: restoreFocus successfully completed")
-    except Exception as e:
-        log.error(f"QuickUISearch: exception in restoreFocus: {e}", exc_info=True)
+def returnToOriginalFocus(originalFocus):
+    """After Cancel, make sure the original application is in front again.
+    Only touches focus if Windows did not already return it."""
+    if not originalFocus:
+        return
+    try:
+        focus = api.getFocusObject()
+        origRoot = getRootWindow(getattr(originalFocus, "windowHandle", None))
+        focusRoot = getRootWindow(getattr(focus, "windowHandle", None))
+        if focus and focusRoot == origRoot:
+            return
+        _bringToForeground(originalFocus)
+        originalFocus.setFocus()
+    except Exception:
+        log.debugWarning("QuickUISearch: could not restore focus", exc_info=True)
 
 
 class QuickSearchDialog(wx.Dialog):
-    """
-    TalkBack-Style Screen Search Dialog.
-    Searches ONLY the validated active visible container.
-    """
 
-    def __init__(self, parent, rootObj, originalFocus, hwnd):
-        log.info(f"QuickUISearch: QuickSearchDialog __init__ starting for HWND {hwnd}")
-        self._isAlive = True
-
-        self.rootObj = rootObj
-        self.originalFocus = originalFocus
-        self.hwnd = hwnd
-        self.windowRect = getWindowBoundingRect(hwnd)
-
-        # Detect and validate the nearest active container with verified interactive controls
-        self.scopeRoot = resolveActiveInteractiveScope(originalFocus, rootObj, self.windowRect)
-
-        # Scope key identifying the active visible interface
-        self.scopeKey = (
-            hwnd,
-            getObjectId(self.scopeRoot),
-            getattr(self.scopeRoot, 'name', '') or getattr(rootObj, 'name', '')
-        )
-
-        appName = ""
-        try:
-            appName = getattr(self.scopeRoot, 'name', None) or getattr(rootObj, 'name', None) or rootObj.appModule.appName
-        except Exception:
-            pass
-
-        title = _("Quick UI Search")
-        if appName:
-            title = f"{title} - {appName}"
-
+    def __init__(self, parent, searchRoot, windowRect, title):
         super().__init__(
             parent,
             title=title,
             style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
-            size=(540, 480)
+            size=(540, 480),
         )
-
-        # Focus info for ranking proximity
-        focusHwnd = getattr(originalFocus, 'windowHandle', None) or hwnd
-        focusCenter = getCenterCoordinates(originalFocus)
-        self.focusInfo = (focusHwnd, focusCenter)
-
+        self.searchRoot = searchRoot
+        self.windowRect = windowRect
         self.allControls = []
         self.displayedMatches = []
         self.selectedObject = None
+        self._closing = False
+        self._scanner = None
+        self._refreshTimer = None
+        self._shownStrings = []
 
         mainSizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Search query field
-        searchLabel = wx.StaticText(self, label=_("&Search for control:"))
-        mainSizer.Add(searchLabel, 0, wx.ALL, 6)
-
+        mainSizer.Add(wx.StaticText(self, label=_("&Search for control:")), 0, wx.ALL, 6)
         self.searchTextCtrl = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
         mainSizer.Add(self.searchTextCtrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
-        # Controls List / Results Label
-        self.listLabel = wx.StaticText(self, label=_("&Visible Controls List:"))
+        self.listLabel = wx.StaticText(self, label=_("&Results:"))
         mainSizer.Add(self.listLabel, 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
-
-        # Controls List Box
         self.resultsListBox = wx.ListBox(self, style=wx.LB_SINGLE)
         mainSizer.Add(self.resultsListBox, 1, wx.EXPAND | wx.ALL, 6)
 
-        # Buttons
         btnSizer = wx.BoxSizer(wx.HORIZONTAL)
-
-        self.okBtn = wx.Button(self, wx.ID_OK, label=_("&Focus Control"))
+        self.okBtn = wx.Button(self, wx.ID_OK, label=_("&Go to control"))
         self.okBtn.Enable(False)
         btnSizer.Add(self.okBtn, 0, wx.RIGHT, 6)
-
-        self.cancelBtn = wx.Button(self, wx.ID_CANCEL, label=_("Cancel"))
-        btnSizer.Add(self.cancelBtn, 0, 0)
-
+        btnSizer.Add(wx.Button(self, wx.ID_CANCEL, label=_("Cancel")), 0)
         mainSizer.Add(btnSizer, 0, wx.ALIGN_RIGHT | wx.ALL, 8)
 
         self.SetSizer(mainSizer)
         self.CenterOnScreen()
 
-        # Bindings
-        self.searchTextCtrl.Bind(wx.EVT_TEXT, self.onSearchTextChanged)
-        self.searchTextCtrl.Bind(wx.EVT_TEXT_ENTER, self.onSearchEnter)
+        self.searchTextCtrl.Bind(wx.EVT_TEXT, lambda evt: self.applyFilter(keepSelection=False))
         self.resultsListBox.Bind(wx.EVT_LISTBOX_DCLICK, self.onConfirm)
         self.okBtn.Bind(wx.EVT_BUTTON, self.onConfirm)
-        self.cancelBtn.Bind(wx.EVT_BUTTON, self.onCancel)
+        self.Bind(wx.EVT_BUTTON, self.onCancel, id=wx.ID_CANCEL)
         self.Bind(wx.EVT_CHAR_HOOK, self.onCharHook)
-        self.Bind(wx.EVT_CLOSE, self.onCloseWindow)
+        self.Bind(wx.EVT_CLOSE, self.onCancel)
+        self.Bind(wx.EVT_ACTIVATE, self.onActivate)
 
         self.searchTextCtrl.SetFocus()
-        log.info(f"QuickUISearch: Active scope initialized: {self.scopeKey}")
-        self.initScopeIndex()
+        self.startScan()
 
-    def isValid(self):
-        """Check if dialog instance is valid and not destroyed."""
-        if not getattr(self, '_isAlive', False):
-            return False
-        try:
-            return bool(super().__nonzero__())
-        except Exception:
-            return False
+    # Scanning
 
-    def cleanupAndClose(self, resultCode):
-        """Safely stops workers, marks dialog as dead, and ends modal."""
-        log.info(f"QuickUISearch: cleanupAndClose called with resultCode {resultCode}")
-        self._isAlive = False
-        cacheManager.stopAllWorkers()
-        try:
-            if self.IsModal():
-                self.EndModal(resultCode)
-        except Exception as e:
-            log.error(f"QuickUISearch: error in EndModal: {e}")
+    def startScan(self):
+        self.stopScan()
+        self.allControls = []
+        self.applyFilter(keepSelection=False)
+        self._scanner = ScreenScanner(self.searchRoot, self.windowRect, self.onBatch, self.onScanDone)
+        self._scanner.start()
 
-    def destroyDialog(self):
-        """Safely destroys wx dialog on the main thread."""
-        log.info("QuickUISearch: destroyDialog starting")
-        self._isAlive = False
-        cacheManager.stopAllWorkers()
-        try:
-            self.Destroy()
-        except Exception as e:
-            log.error(f"QuickUISearch: error destroying dialog: {e}")
-        log.info("QuickUISearch: destroyDialog completed")
+    def stopScan(self):
+        if self._scanner:
+            self._scanner.cancel()
+            self._scanner = None
+        self._cancelRefresh()
 
-    def initScopeIndex(self):
-        """Load or build the active visible screen scope index."""
-        cached = cacheManager.getVisibleControls(self.scopeKey)
-        if cached:
-            log.info(f"QuickUISearch: Loading {len(cached)} cached visible controls for scope")
-            self.allControls = cached
-            self.applyFilter(preserveSelection=False)
-            self.startVisibleLiveScan()
-        else:
-            log.info("QuickUISearch: Starting visible scope indexing for active screen")
-            self.allControls = []
-            self.applyFilter(preserveSelection=False)
-            self.startVisibleScopeIndexing()
-
-    def startVisibleScopeIndexing(self):
-        """Initiate background indexing strictly for visible screen controls."""
-        try:
-            ui.message(_("Indexing visible screen controls…"))
-        except Exception:
-            pass
-
-        def onBatch(newBatch):
-            if not self.isValid():
-                return
-            existingIds = {c["id"] for c in self.allControls}
-            added = False
-            for item in newBatch:
-                if item["id"] not in existingIds:
-                    self.allControls.append(item)
-                    existingIds.add(item["id"])
-                    added = True
-            if added:
-                self.applyFilter(preserveSelection=True)
-
-        def onProgress(count):
-            if self.isValid():
-                try:
-                    ui.message(_("{count} controls indexed").format(count=count))
-                except Exception:
-                    pass
-
-        def onFinished(allItems):
-            if not self.isValid():
-                return
-            log.info(f"QuickUISearch: Visible indexing finished with {len(allItems)} controls")
-            self.allControls = allItems
-            self.applyFilter(preserveSelection=True)
+    def _cancelRefresh(self):
+        if self._refreshTimer:
             try:
-                ui.message(_("Ready"))
+                self._refreshTimer.Stop()
             except Exception:
                 pass
+            self._refreshTimer = None
 
-        cacheManager.startVisibleScopeIndexing(
-            self.scopeRoot,
-            self.scopeKey,
-            self.windowRect,
-            onBatch=onBatch,
-            onProgress=onProgress,
-            onFinished=onFinished
-        )
-
-    def startVisibleLiveScan(self):
-        """Asynchronously scan for new visible controls in active container and merge."""
-        def onNewDiscovered(newDiscoveredList):
-            if not self.isValid() or not newDiscoveredList:
-                return
-            existingIds = {c["id"] for c in self.allControls}
-            newAddedCount = 0
-            for item in newDiscoveredList:
-                if item["id"] not in existingIds:
-                    self.allControls.append(item)
-                    existingIds.add(item["id"])
-                    newAddedCount += 1
-
-            if newAddedCount > 0:
-                log.info(f"QuickUISearch: Visible live scan merged {newAddedCount} new controls")
-                query = self.searchTextCtrl.GetValue().strip().lower()
-                self.applyFilter(preserveSelection=True)
-                if query:
-                    matchingNew = [it for it in newDiscoveredList if query in it["searchIndex"]]
-                    if len(matchingNew) == 1:
-                        ui.message(_("1 new match found."))
-                    elif len(matchingNew) > 1:
-                        ui.message(_("{count} new matches found.").format(count=len(matchingNew)))
-
-        cacheManager.startVisibleLiveScan(
-            self.scopeRoot,
-            self.originalFocus,
-            self.scopeKey,
-            self.windowRect,
-            onNewMatches=onNewDiscovered
-        )
-
-    def onSearchTextChanged(self, evt):
-        """Real-time filter as the user types without requiring Enter."""
-        if not self.isValid():
+    def onBatch(self, batch):
+        if self._closing:
             return
-        self.applyFilter(preserveSelection=False)
+        self.allControls.extend(batch)
+        # Refresh the list a few times a second rather than on every batch.
+        if not self._refreshTimer:
+            self._refreshTimer = wx.CallLater(LIST_REFRESH_MS, self._onRefreshTimer)
 
-    def applyFilter(self, preserveSelection=True):
-        """Apply smart ranking to visible controls and update display with 'Name — Role'."""
-        if not self.isValid():
+    def _onRefreshTimer(self):
+        self._refreshTimer = None
+        self.applyFilter(keepSelection=True)
+
+    def onScanDone(self):
+        if self._closing:
             return
-
-        query = self.searchTextCtrl.GetValue().strip()
-
-        # Rank and filter strictly within visible screen controls
-        self.displayedMatches = rankAndFilterControls(self.allControls, query, self.focusInfo)
-
-        # Update Label
-        if not query:
-            self.listLabel.SetLabel(_("&Visible Controls List ({count}):").format(count=len(self.displayedMatches)))
+        self._cancelRefresh()
+        self.applyFilter(keepSelection=True)
+        count = len(self.displayedMatches)
+        if self.searchTextCtrl.GetValue().strip():
+            if count == 0:
+                ui.message(_("No matches"))
+            elif count == 1:
+                ui.message(_("1 match"))
+            else:
+                ui.message(_("{count} matches").format(count=count))
+        elif count == 0:
+            ui.message(_("No controls found"))
+        elif count == 1:
+            ui.message(_("1 control"))
         else:
-            self.listLabel.SetLabel(_("&Matching controls ({count}):").format(count=len(self.displayedMatches)))
+            ui.message(_("{count} controls").format(count=count))
 
-        displayStrings = formatDisplayStrings(self.displayedMatches)
+    @property
+    def isScanning(self):
+        return bool(self._scanner and not self._scanner.finished)
 
-        # Flicker-free ListBox update
+    # List
+
+    def applyFilter(self, keepSelection=True):
+        if self._closing:
+            return
+        query = self.searchTextCtrl.GetValue()
+        selectedObj = None
+        if keepSelection:
+            sel = self.resultsListBox.GetSelection()
+            if sel != wx.NOT_FOUND and sel < len(self.displayedMatches):
+                selectedObj = self.displayedMatches[sel]["object"]
+
+        self.displayedMatches = rankAndFilterControls(self.allControls, query)
+        count = len(self.displayedMatches)
+        self.listLabel.SetLabel(_("&Results ({count}):").format(count=count))
+        newStrings = formatDisplayStrings(self.displayedMatches)
+        oldStrings = self._shownStrings
+        self._shownStrings = newStrings
+
+        if keepSelection and newStrings == oldStrings:
+            return
+        if keepSelection and oldStrings and newStrings[:len(oldStrings)] == oldStrings:
+            # New items only arrived at the end: add them without touching the
+            # selection, so NVDA does not re-read the current item.
+            self.resultsListBox.Append(newStrings[len(oldStrings):])
+            self.okBtn.Enable(count > 0)
+            return
+
+        newSel = 0
+        if selectedObj is not None:
+            for i, c in enumerate(self.displayedMatches):
+                if c["object"] is selectedObj:
+                    newSel = i
+                    break
+
         self.resultsListBox.Freeze()
         try:
-            curSel = self.resultsListBox.GetSelection()
-            self.resultsListBox.Set(displayStrings)
-
-            matchCount = len(displayStrings)
-            if matchCount > 0:
-                if preserveSelection and curSel != wx.NOT_FOUND and curSel < matchCount:
-                    self.resultsListBox.SetSelection(curSel)
-                else:
-                    self.resultsListBox.SetSelection(0)
-                self.okBtn.Enable(True)
-            else:
-                self.okBtn.Enable(False)
+            self.resultsListBox.Set(newStrings)
+            if count:
+                self.resultsListBox.SetSelection(newSel)
         finally:
             self.resultsListBox.Thaw()
+        self.okBtn.Enable(count > 0)
 
-    def onSearchEnter(self, evt):
-        """Enter key in search box moves focus to list or confirms selection."""
-        if not self.isValid():
+    # Closing
+
+    def onConfirm(self, evt=None):
+        if self._closing:
             return
-        if len(self.displayedMatches) > 0:
-            self.resultsListBox.SetFocus()
-        else:
-            if cacheManager.isIndexing:
-                try:
-                    ui.message(_("Searching visible screen..."))
-                except Exception:
-                    pass
-            else:
-                try:
-                    ui.message(_("No matching controls found on the current screen."))
-                except Exception:
-                    pass
-
-    def handleObjectEvent(self, obj, eventType):
-        """Handle real-time UI Automation / IAccessible events for the active visible screen."""
-        if not self.isValid():
-            return
-
-        try:
-            objId = getObjectId(obj)
-
-            if eventType in ("hide",):
-                cacheManager.removeVisibleControl(self.scopeKey, objId)
-                self.allControls = [c for c in self.allControls if c["id"] != objId]
-                self.applyFilter(preserveSelection=True)
-                return
-
-            if eventType == "stateChange":
-                if not isControlVisibleOnScreen(obj, self.windowRect):
-                    cacheManager.removeVisibleControl(self.scopeKey, objId)
-                    self.allControls = [c for c in self.allControls if c["id"] != objId]
-                    self.applyFilter(preserveSelection=True)
-                    return
-
-            if eventType in ("structureChanged", "show"):
-                updatedControls = cacheManager.scanVisibleBranch(obj, self.scopeKey, self.windowRect)
-                existingIds = {c["id"] for c in self.allControls}
-                added = False
-                for item in updatedControls:
-                    if item["id"] not in existingIds:
-                        self.allControls.append(item)
-                        existingIds.add(item["id"])
-                        added = True
-                    else:
-                        idx = next((i for i, c in enumerate(self.allControls) if c["id"] == item["id"]), None)
-                        if idx is not None:
-                            self.allControls[idx] = item
-                if added or updatedControls:
-                    self.applyFilter(preserveSelection=True)
-                return
-
-            if eventType in ("nameChange", "descriptionChange", "valueChange", "stateChange"):
-                info = extractControlInfo(obj, self.windowRect)
-                if not info:
-                    cacheManager.removeVisibleControl(self.scopeKey, objId)
-                    self.allControls = [c for c in self.allControls if c["id"] != objId]
-                    self.applyFilter(preserveSelection=True)
-                    return
-
-                cacheManager.upsertVisibleControl(self.scopeKey, info)
-                idx = next((i for i, c in enumerate(self.allControls) if c["id"] == objId), None)
-                if idx is not None:
-                    self.allControls[idx] = info
-                else:
-                    self.allControls.append(info)
-                self.applyFilter(preserveSelection=True)
-
-        except Exception as e:
-            log.error(f"QuickUISearch: error in handleObjectEvent: {e}", exc_info=True)
-
-    def onConfirm(self, evt):
-        if not self.isValid():
-            return
-
-        log.info("QuickUISearch: onConfirm (Enter / OK) triggered")
         sel = self.resultsListBox.GetSelection()
-        if sel != wx.NOT_FOUND and sel < len(self.displayedMatches):
-            self.selectedObject = self.displayedMatches[sel]["object"]
-            log.info(f"QuickUISearch: Selection confirmed for match '{self.displayedMatches[sel]['name']}'")
-            self.cleanupAndClose(wx.ID_OK)
-        else:
-            log.info("QuickUISearch: onConfirm called with no list selection")
+        if sel == wx.NOT_FOUND or sel >= len(self.displayedMatches):
+            if self.isScanning:
+                ui.message(_("Still scanning the screen…"))
+            else:
+                ui.message(_("No matching controls on this screen."))
+            return
+        self.selectedObject = self.displayedMatches[sel]["object"]
+        self._close(wx.ID_OK)
 
-    def onCancel(self, evt):
-        log.info("QuickUISearch: onCancel (Esc / Cancel) triggered")
+    def onCancel(self, evt=None):
+        if self._closing:
+            return
         self.selectedObject = None
-        self.cleanupAndClose(wx.ID_CANCEL)
+        self._close(wx.ID_CANCEL)
 
-    def onCloseWindow(self, evt):
-        log.info("QuickUISearch: onCloseWindow (Window Close Event) triggered")
-        self.onCancel(None)
+    def onActivate(self, evt):
+        # If you switch to another window (or an app grabs the foreground),
+        # close instead of staying open, hidden, and catching your typing.
+        if not evt.GetActive() and not self._closing:
+            wx.CallAfter(self._abandon)
+        evt.Skip()
 
-    def reindexCurrentWindow(self):
-        """Re-index the current visible screen (Ctrl+R)."""
-        if not self.isValid():
+    def _abandon(self):
+        if self._closing or self.IsActive():
             return
-        log.info(f"QuickUISearch: Re-indexing visible screen scope {self.scopeKey}")
-        cacheManager.clearScope(self.scopeKey)
-        self.allControls = []
-        self.displayedMatches = []
-        self.resultsListBox.Clear()
-        self.okBtn.Enable(False)
-        self.startVisibleScopeIndexing()
+        self.selectedObject = None
+        self._close(wx.ID_ABORT)
 
-    def clearCacheAndRebuild(self):
-        """Clear all scopes completely and rebuild (Ctrl+Shift+R)."""
-        if not self.isValid():
-            return
-        log.info("QuickUISearch: Clearing all cached scopes (Ctrl+Shift+R)")
-        cacheManager.clearAll()
-        self.allControls = []
-        self.displayedMatches = []
-        self.resultsListBox.Clear()
-        self.okBtn.Enable(False)
-        self.startVisibleScopeIndexing()
+    def _close(self, result):
+        self._closing = True
+        self.stopScan()
+        if self.IsModal():
+            self.EndModal(result)
 
     def onCharHook(self, evt):
-        if not self.isValid():
+        if self._closing:
             return
+        key = evt.GetKeyCode()
+        focused = self.FindFocus()
 
-        try:
-            keyCode = evt.GetKeyCode()
-            controlDown = evt.ControlDown()
-            shiftDown = evt.ShiftDown()
-
-            # Ctrl+Shift+R: Clear all cache and rebuild
-            if controlDown and shiftDown and keyCode == ord('R'):
-                self.clearCacheAndRebuild()
+        if evt.ControlDown() and not evt.AltDown() and key == ord("R"):
+            ui.message(_("Rescanning"))
+            self.startScan()
+            return
+        if key == wx.WXK_ESCAPE:
+            self.onCancel()
+            return
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            if focused == self.searchTextCtrl and not self.displayedMatches:
+                self.onConfirm()  # announces why nothing can be chosen
                 return
-
-            # Ctrl+R: Re-index current visible scope
-            if controlDown and not shiftDown and keyCode == ord('R'):
-                self.reindexCurrentWindow()
+            if focused in (self.searchTextCtrl, self.resultsListBox, self.okBtn):
+                self.onConfirm()
                 return
-
-            # Enter key handling
-            if keyCode in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
-                focused = self.FindFocus()
-                if focused == self.searchTextCtrl:
-                    if len(self.displayedMatches) > 0:
-                        self.resultsListBox.SetFocus()
-                        return
-                    else:
-                        self.onSearchEnter(None)
-                        return
-                elif focused == self.resultsListBox or focused == self.okBtn:
-                    self.onConfirm(None)
-                    return
-                else:
-                    self.onConfirm(None)
-                    return
-
-            # Down arrow in search box moves focus into Controls List
-            if keyCode == wx.WXK_DOWN and self.FindFocus() == self.searchTextCtrl:
-                if len(self.displayedMatches) > 0:
-                    self.resultsListBox.SetFocus()
-                    return
-
-            # Escape key cancel
-            if keyCode == wx.WXK_ESCAPE:
-                self.onCancel(None)
-                return
-        except Exception as e:
-            log.error(f"QuickUISearch: error in onCharHook: {e}", exc_info=True)
-
+        if key == wx.WXK_DOWN and focused == self.searchTextCtrl and self.displayedMatches:
+            self.resultsListBox.SetFocus()
+            return
         evt.Skip()
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
-    """Quick UI Search Global Plugin with TalkBack-style screen search."""
+    """Has no event handlers: it does nothing until NVDA+J is pressed."""
 
     scriptCategory = _("Quick UI Search")
 
     def __init__(self):
         super().__init__()
-        self._isDialogOpen = False
-        self._activeDialog = None
-        log.info("QuickUISearch: GlobalPlugin initialized")
+        self._busy = False
 
     @scriptHandler.script(
-        description=_("Searches accessible controls on the currently visible screen and moves focus to the selected control."),
-        category=_("Quick UI Search"),
-        gestures=["kb:NVDA+j"]
+        description=_("Searches the controls on the current screen and moves to the one you choose."),
+        gesture="kb:NVDA+j",
     )
     def script_quickUISearch(self, gesture):
-        if self._isDialogOpen:
-            log.info("QuickUISearch: Dialog already open, ignoring shortcut gesture")
+        if self._busy:
             return
-        log.info("QuickUISearch: Shortcut NVDA+J pressed, scheduling dialog on main thread")
+        self._busy = True
         wx.CallAfter(self._openSearchDialog)
 
+    def _done(self):
+        self._busy = False
+
     def _openSearchDialog(self):
-        if self._isDialogOpen:
-            return
-
-        originalFocus = api.getFocusObject()
-        rootObj = api.getForegroundObject() or originalFocus
-
-        if not rootObj:
-            log.warning("QuickUISearch: No accessible foreground object available")
-            try:
-                ui.message(_("No accessible foreground application found."))
-            except Exception:
-                pass
-            return
-
-        hwnd = getattr(rootObj, 'windowHandle', None) or winUser.getForegroundWindow()
-        log.info(f"QuickUISearch: _openSearchDialog starting for HWND {hwnd}")
-
-        self._isDialogOpen = True
-        import gui
-        gui.mainFrame.prePopup()
-        dialog = None
-        res = wx.ID_CANCEL
-        selectedObj = None
-
         try:
-            dialog = QuickSearchDialog(gui.mainFrame, rootObj, originalFocus, hwnd)
-            self._activeDialog = dialog
-            res = dialog.ShowModal()
-            selectedObj = dialog.selectedObject
-        except Exception as e:
-            log.error(f"QuickUISearch: exception during dialog ShowModal: {e}", exc_info=True)
+            originalFocus = api.getFocusObject()
+            foreground = api.getForegroundObject() or originalFocus
+            if not foreground:
+                ui.message(_("No accessible application in the foreground."))
+                self._done()
+                return
+            searchRoot = resolveSearchRoot(originalFocus, foreground)
+            hwnd = getattr(foreground, "windowHandle", None) or winUser.getForegroundWindow()
+            windowRect = getVisibleArea(searchRoot, hwnd)
+
+            title = _("Quick UI Search")
+            appTitle = (getattr(searchRoot, "name", None) or getattr(foreground, "name", None) or "").strip()
+            if appTitle:
+                title = f"{title} - {appTitle}"
+        except Exception:
+            log.error("QuickUISearch: could not prepare the search", exc_info=True)
+            ui.message(_("Unable to search this screen."))
+            self._done()
+            return
+
+        import gui
+        result = wx.ID_CANCEL
+        selected = None
+        dialog = None
+        gui.mainFrame.prePopup()
+        try:
+            dialog = QuickSearchDialog(gui.mainFrame, searchRoot, windowRect, title)
+            result = dialog.ShowModal()
+            selected = dialog.selectedObject
+        except Exception:
+            log.error("QuickUISearch: dialog error", exc_info=True)
         finally:
-            log.info("QuickUISearch: Dialog modal completed, performing cleanup")
-            self._isDialogOpen = False
-            self._activeDialog = None
-            cacheManager.stopAllWorkers()
             if dialog:
-                dialog.destroyDialog()
+                dialog.stopScan()
+                dialog.Destroy()
             gui.mainFrame.postPopup()
 
-        log.info(f"QuickUISearch: Dialog finished with result: {'OK' if res == wx.ID_OK else 'CANCEL'}")
-
-        if res == wx.ID_OK and selectedObj:
-            log.info("QuickUISearch: Scheduling jumpToControl on main thread (callLater 60ms)")
-            core.callLater(60, jumpToControl, selectedObj, originalFocus)
+        if result == wx.ID_OK and selected is not None:
+            core.callLater(JUMP_DELAY_MS, jumpToControl, selected, originalFocus, self._done)
+        elif result == wx.ID_ABORT:
+            # You switched away yourself; leave focus where you put it.
+            self._done()
         else:
-            log.info("QuickUISearch: Scheduling restoreFocus on main thread (callLater 60ms)")
-            core.callLater(60, restoreFocus, originalFocus)
+            core.callLater(JUMP_DELAY_MS, self._cancelled, originalFocus)
 
-    # Real-time event hooks
-    def _dispatchRealtimeEvent(self, obj, eventType):
-        if not self._isDialogOpen or self._activeDialog is None:
-            return
-        dialog = self._activeDialog
-        if not dialog or not dialog.isValid():
-            return
-
+    def _cancelled(self, originalFocus):
         try:
-            dialogHwnd = getattr(dialog, 'hwnd', None)
-            objHwnd = getattr(obj, 'windowHandle', None)
-            if objHwnd and dialogHwnd:
-                if winUser.getAncestor(objHwnd, winUser.GA_ROOT) != winUser.getAncestor(dialogHwnd, winUser.GA_ROOT):
-                    return
-
-            def eventCallback():
-                try:
-                    if dialog and dialog.isValid():
-                        dialog.handleObjectEvent(obj, eventType)
-                except Exception as ex:
-                    log.error(f"QuickUISearch: exception in eventCallback ({eventType}): {ex}", exc_info=True)
-
-            wx.CallAfter(eventCallback)
-        except Exception as e:
-            log.error(f"QuickUISearch: exception in _dispatchRealtimeEvent ({eventType}): {e}", exc_info=True)
-
-    def event_nameChange(self, obj, nextHandler):
-        self._dispatchRealtimeEvent(obj, "nameChange")
-        nextHandler()
-
-    def event_descriptionChange(self, obj, nextHandler):
-        self._dispatchRealtimeEvent(obj, "descriptionChange")
-        nextHandler()
-
-    def event_valueChange(self, obj, nextHandler):
-        self._dispatchRealtimeEvent(obj, "valueChange")
-        nextHandler()
-
-    def event_stateChange(self, obj, nextHandler):
-        self._dispatchRealtimeEvent(obj, "stateChange")
-        nextHandler()
-
-    def event_show(self, obj, nextHandler):
-        self._dispatchRealtimeEvent(obj, "show")
-        nextHandler()
-
-    def event_hide(self, obj, nextHandler):
-        self._dispatchRealtimeEvent(obj, "hide")
-        nextHandler()
-
-    def event_UIA_structureChanged(self, obj, nextHandler):
-        self._dispatchRealtimeEvent(obj, "structureChanged")
-        nextHandler()
-
-    __gestures__ = {
-        "kb:NVDA+j": "quickUISearch",
-    }
+            returnToOriginalFocus(originalFocus)
+        finally:
+            self._done()

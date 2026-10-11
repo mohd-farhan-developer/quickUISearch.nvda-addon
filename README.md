@@ -1,35 +1,51 @@
 # Quick UI Search for NVDA
 
-Quick UI Search is a high-performance NVDA add-on for Windows that provides **TalkBack-style Screen Search** across the currently visible, active user interface.
+Quick UI Search is an NVDA add-on for Windows that provides **TalkBack-style screen search**: find any control on the current screen by typing part of its name, then jump straight to it.
 
-## Key Features
+## How to use
 
-- **Shortcut**: Press **`NVDA+J`** from anywhere to open the Quick UI Search dialog.
-- **Visible Screen Search (TalkBack-Style)**:
-  - Searches strictly within the **active visible interface container** (voice channel, chat view, dialog, or tab panel).
-  - Automatically isolates the active view, completely excluding background panels, other Discord servers/channels, and off-screen controls.
-  - Dynamically updates the active search scope when you switch to another server, channel, dialog, or window.
-- **Visible Controls List**:
-  - When the search box is empty, automatically displays every visible, accessible control in the active interface.
-- **Smart Ranking**:
-  - Prioritizes interactive controls (**Buttons, Toggle Buttons, Menu Items, Links, Edit Fields, Checkboxes, Tabs, List Items, Tree Items**) above static text.
-  - Multi-tier matching: Exact name match → Starts with name → Contains name → Description/Value → Role.
-  - Ranks controls closest to the current keyboard focus first.
-- **Clean Result Display**:
-  - Formatted as **`Name — Role`** (e.g. `Watch Stream — Button`, `General — Voice Channel`).
-  - Descriptions are hidden by default and only shown to distinguish controls with identical names.
-- **Real-Time As-You-Type Filtering**:
-  - Filters results in real-time as you type without requiring Enter.
-- **Keyboard Navigation**:
-  - **Down Arrow** (from search box): Moves keyboard focus directly into the Controls List.
-  - **Up / Down Arrow**: Move through results.
-  - **Enter** (on a result): Dismisses the dialog and jumps keyboard focus directly to that control.
-  - **Escape**: Closes the dialog and restores your original keyboard focus.
-  - **Ctrl+R**: Re-indexes the current visible screen scope.
-  - **Ctrl+Shift+R**: Clears all cached scopes and rebuilds from scratch.
+1. Press **`NVDA+J`** from anywhere.
+2. Start typing. The list filters as you type; every word you type must appear in the control.
+3. Press **Enter** (or **Down Arrow** to browse the list first, then Enter) to jump to the control.
+
+## What it searches
+
+- Only controls that are actually **visible** in the foreground window. Hidden, off-screen, scrolled-away and collapsed controls are left out.
+- If focus is inside a **dialog, alert or open menu**, only that dialog or menu is searched.
+- Text that just repeats a button's own name is shown once, not twice.
+- Very long lists (thousands of files, for example) are walked item by item and only the part on screen is read, so NVDA never stalls.
+
+## Results
+
+- Shown as **`Name, role`** (e.g. `Mute, button`); disabled controls are marked *(unavailable)*.
+- Ranking: exact name → name starts with your text → a word in the name starts with it → name contains it → other matches. Buttons, links, fields and other interactive controls come before plain text, then screen order.
+
+## Jumping to a control
+
+- In a web page or Electron app (Discord, etc.) in **browse mode**, the browse mode cursor moves to the control, like NVDA's Elements List.
+- Otherwise keyboard focus moves to the control.
+- If the control cannot take focus (plain text, for example), NVDA's review cursor (navigator object) moves there and reads it.
+
+## Keys in the dialog
+
+- **Down Arrow** (in the search box): move into the results list.
+- **Enter**: jump to the selected control.
+- **Escape**: close and return to where you were.
+- Switching to another window closes the dialog and leaves you where you switched to.
+- **Ctrl+R**: scan the screen again.
+
+## Performance
+
+The add-on has no background hooks: it does nothing until you press `NVDA+J`, and keeps nothing after the dialog closes. The screen scan runs in small slices on NVDA's main thread, so NVDA keeps speaking normally while it runs.
 
 ## Installation
 
-1. Open NVDA Menu (`NVDA+N`) -> **Tools** -> **Manage Add-ons**.
-2. Click **Install...** and select `quickUISearch.nvda-addon`.
-3. Confirm installation and restart NVDA when prompted.
+1. Open NVDA Menu (`NVDA+N`) → **Tools** → **Add-on store** (or **Manage add-ons** in older versions).
+2. Choose **Install from external source** and select `quickUISearch.nvda-addon`.
+3. Restart NVDA when prompted.
+
+## Building
+
+```
+python build.py
+```

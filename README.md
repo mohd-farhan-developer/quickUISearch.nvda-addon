@@ -49,3 +49,7 @@ The add-on has no background hooks: it does nothing until you press `NVDA+J`, an
 ```
 python build.py
 ```
+
+## License
+
+GNU General Public License, version 2. See [LICENSE](LICENSE).
